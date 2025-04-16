@@ -13,10 +13,6 @@ from einops import rearrange, repeat, reduce, pack
 from einops.layers.torch import Rearrange
 from x_transformers import Encoder
 from x_transformers.x_transformers import AbsolutePositionalEmbedding
-from vector_quantize_pytorch import (
-    ResidualVQ,
-    ResidualLFQ
-)
 from meshgpt_pytorch.data import derive_face_edges_from_faces
 from meshgpt_pytorch.meshgpt_pytorch import (
     discretize, get_derived_face_features,
@@ -26,14 +22,103 @@ from meshgpt_pytorch.meshgpt_pytorch import (
 from torch_geometric.nn.conv import SAGEConv
 import torch.nn.functional as F
 
+import numpy as np
+
+class DiagonalGaussianDistribution(object):
+    def __init__(self, parameters, deterministic=False, mask=None):
+        self.parameters = parameters
+        self.mean, self.logvar = torch.chunk(parameters, 2, dim=-1)
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
+        self.mask = mask
+        if self.deterministic:
+            self.var = self.std = torch.zeros_like(self.mean).to(device=self.parameters.device)
+
+    def sample(self):
+        # x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.parameters.device)
+        noise = torch.randn(self.mean.shape).to(device=self.parameters.device)
+        x = self.mean + self.std * noise
+        if self.mask is not None:
+            x = x * self.mask.unsqueeze(-1)  # broadcast over latent dim
+        return x
+
+    def kl(self, other=None):
+        if self.deterministic:
+            return torch.Tensor([0.])
+        else:
+            if other is None:
+                return 0.5 * torch.sum(torch.pow(self.mean, 2)
+                                       + self.var - 1.0 - self.logvar,
+                                       dim=[1, 2])
+            else:
+                return 0.5 * torch.sum(
+                    torch.pow(self.mean - other.mean, 2) / other.var
+                    + self.var / other.var - 1.0 - self.logvar + other.logvar,
+                    dim=[1, 2, 3])
+
+    # def kl(self, other=None):
+    #     if self.deterministic:
+    #         return torch.tensor([0.], device=self.parameters.device)
+    #     if other is None:
+    #         kl = 0.5 * torch.sum(
+    #             self.mean.pow(2) + self.var - 1.0 - self.logvar,
+    #             dim=-1  # per latent dim
+    #         )
+    #     else:
+    #         kl = 0.5 * torch.sum(
+    #             (self.mean - other.mean).pow(2) / other.var +
+    #             self.var / other.var - 1.0 -
+    #             self.logvar + other.logvar,
+    #             dim=-1
+    #         )
+
+    #     if self.mask is not None:
+    #         kl = kl * self.mask  # shape: [B, N]
+    #     return kl.sum(dim=-1)  # sum over N
+
+
+    def nll(self, sample, dims=[1,2,3]):
+        if self.deterministic:
+            return torch.Tensor([0.])
+        logtwopi = np.log(2.0 * np.pi)
+        return 0.5 * torch.sum(
+            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
+            dim=dims)
+
+    # def nll(self, sample, dims=[1, 2]):
+    #     if self.deterministic:
+    #         return torch.tensor([0.], device=self.parameters.device)
+
+    #     logtwopi = np.log(2.0 * np.pi)
+    #     nll = 0.5 * (logtwopi + self.logvar + (sample - self.mean).pow(2) / self.var)
+    #     nll = nll.sum(dim=-1)  # sum over latent dim
+
+    #     if self.mask is not None:
+    #         nll = nll * self.mask
+    #     return nll.sum(dim=-1)  # sum over N
+
+
+    def mode(self):
+        return self.mean
+
+    # def mode(self):
+    #     if self.mask is not None:
+    #         return self.mean * self.mask.unsqueeze(-1)  # mask shape [B, N] -> [B, N, 1]
+    #     return self.mean
+
 @save_load()
 class MeshAutoencoder(Module):
     @beartype
     def __init__(
         self,
         encoder_depth = 12,
+        decoder_depth = 18,
         encoder_heads = 8,
-        encoder_dim = 512,
+        decoder_heads = 8,
+        encoder_dim = 768,
+        decoder_dim = 384,
         decoder_fine_dim = 192,
         num_discrete_coors = 128,
         coor_continuous_range: Tuple[float, float] = (-1., 1.),
@@ -44,32 +129,19 @@ class MeshAutoencoder(Module):
         dim_normal_embed = 64,
         num_discrete_angle = 128,
         dim_angle_embed = 16,
-        dim_codebook = 192,
-        num_quantizers = 2,           # or 'D' in the paper
-        codebook_size = 16384,        # they use 16k, shared codebook between layers
-        use_residual_lfq = True,      # whether to use the latest lookup-free quantization
-        rq_kwargs: dict = dict(
-            quantize_dropout = True,
-            quantize_dropout_cutoff_index = 1,
-            quantize_dropout_multiple_of = 1,
-        ),
-        rvq_kwargs: dict = dict(
-            kmeans_init = True,
-            threshold_ema_dead_code = 2,
-        ),
-        rlfq_kwargs: dict = dict(
-            frac_per_sample_entropy = 1.
-        ),
-        rvq_stochastic_sample_codes = True,
-        commit_loss_weight = 0.1,
+        
+        kl_loss_weight = 1e-4,
         bin_smooth_blur_sigma = 0.4,  # they blur the one hot discretized coordinate positions
         pad_id = -1,
         checkpoint_quantizer = False,
         patch_size = 1,
         dropout = 0.,
         quant_face = False,
-        use_abs_pos = False,
         graph_layers = 1,
+
+        latent_dim = 8,
+        kl_regularization = True,
+        pos_embed=True,
     ):
         super().__init__()
 
@@ -136,42 +208,9 @@ class MeshAutoencoder(Module):
             ff_dropout = dropout,
         )
 
-        # residual quantization
-
-        self.codebook_size = codebook_size + 1      # add 1 for pad token between pivots and codes
-        self.num_quantizers = num_quantizers
-        self.pad_token_id = codebook_size
 
         self.sim_quant = quant_face
-        if self.sim_quant:
-            dim_codebook2 = dim_codebook
-            self.project_dim_codebook = nn.Linear(encoder_dim, dim_codebook)
-        else:
-            dim_codebook = dim_codebook
-            dim_codebook2 = dim_codebook * 3
-            self.project_dim_codebook = nn.Linear(encoder_dim, dim_codebook * 3)
-
-        if use_residual_lfq:
-            self.quantizer = ResidualLFQ(
-                dim = dim_codebook,
-                num_quantizers = num_quantizers,
-                codebook_size = codebook_size,
-                commitment_loss_weight = 1.,
-                **rlfq_kwargs,
-                **rq_kwargs
-            )
-        else:
-            self.quantizer = ResidualVQ(
-                dim = dim_codebook,
-                num_quantizers = num_quantizers,
-                codebook_size = codebook_size,
-                shared_codebook = True,
-                commitment_weight = 1.,
-                stochastic_sample_codes = rvq_stochastic_sample_codes,
-                **rvq_kwargs,
-                **rq_kwargs
-            )
-
+    
         self.checkpoint_quantizer = checkpoint_quantizer # whether to memory checkpoint the quantizer
 
         self.pad_id = pad_id # for variable lengthed faces, padding quantized ids will be set to this value
@@ -179,26 +218,26 @@ class MeshAutoencoder(Module):
         # decoder
         
         self.init_decoder = nn.Sequential(
-            nn.Linear(dim_codebook2, encoder_dim),
+            nn.Linear(decoder_dim, decoder_dim),
             nn.SiLU(),
-            nn.LayerNorm(encoder_dim),
+            nn.LayerNorm(decoder_dim),
         )
 
         self.decoder_coarse = Encoder(
-            dim = encoder_dim,
-            depth = encoder_depth // 2,
-            heads = encoder_heads,
+            dim = decoder_dim,
+            depth = decoder_depth // 2,
+            heads = decoder_heads,
             attn_flash = True,
             attn_dropout = dropout,
             ff_dropout = dropout,
         )
         
-        self.coarse_to_fine = nn.Linear(encoder_dim, decoder_fine_dim * 3)
+        self.coarse_to_fine = nn.Linear(decoder_dim, decoder_fine_dim * 3)
 
         self.decoder_fine = Encoder(
             dim = decoder_fine_dim,
-            depth = encoder_depth // 2,
-            heads = encoder_heads,
+            depth = decoder_depth // 2,
+            heads = decoder_heads,
             attn_flash = True,
             attn_dropout = dropout,
             ff_dropout = dropout,
@@ -212,8 +251,41 @@ class MeshAutoencoder(Module):
 
         # loss related
 
-        self.commit_loss_weight = commit_loss_weight
+        self.kl_loss_weight = kl_loss_weight
         self.bin_smooth_blur_sigma = bin_smooth_blur_sigma
+
+        self.to_latent = nn.Sequential(
+            nn.Linear(encoder_dim, 2 * latent_dim),  # 输出mean和logvar
+            Rearrange('b n (d k) -> b n d k', k=2)    # [B, N, D, 2]
+        )
+        self.latent_dim = latent_dim
+        self.kl_regularization = kl_regularization
+
+        self.latent_proj = nn.Linear(latent_dim, decoder_dim)
+
+        self.pos_embed = pos_embed
+
+    def reparameterize(self, x, mask=None):
+        if mask is not None:
+            params = self.to_latent(x) * mask.unsqueeze(-1).unsqueeze(-1)  # [B, N, D, 2]
+        else:
+            params = self.to_latent(x)
+
+
+        mean, logvar = params.unbind(dim=-1)  # 拆分为mean和logvar
+        
+        if self.kl_regularization:
+            posterior = DiagonalGaussianDistribution(
+                torch.cat([mean, logvar], dim=-1),
+                mask=mask  # shape [B, N]
+            )
+            latent = posterior.sample()
+            kl = posterior.kl()
+        else:
+            latent = mean
+            kl = None
+        
+        return latent, kl
 
     @beartype
     def encode(
@@ -221,9 +293,12 @@ class MeshAutoencoder(Module):
         *,
         vertices:         TensorType['b', 'nv', 3, float],
         faces:            TensorType['b', 'nf', 3, int],
-        face_edges:       TensorType['b', 'e', 2, int],
-        face_mask:        TensorType['b', 'nf', bool],
-        face_edges_mask:  TensorType['b', 'e', bool],
+        # face_edges:       TensorType['b', 'e', 2, int],
+        # face_mask:        TensorType['b', 'nf', bool],
+        # face_edges_mask:  TensorType['b', 'e', bool],
+        face_edges: Optional[TensorType['b', 'e', 2, int]] = None,
+        face_mask: Optional[TensorType['b', 'nf', bool]] = None,
+        face_edges_mask: Optional[TensorType['b', 'e', bool]] = None,
         return_face_coordinates = False
     ):
         """
@@ -234,7 +309,13 @@ class MeshAutoencoder(Module):
         c - coordinates (3)
         d - embed dim
         """
-
+        if face_edges is None:
+            face_edges = derive_face_edges_from_faces(faces, pad_id=self.pad_id)
+        if face_mask is None:
+            face_mask = reduce(faces != self.pad_id, 'b nf c -> b nf', 'all')
+        if face_edges_mask is None:
+            face_edges_mask = reduce(face_edges != self.pad_id, 'b e ij -> b e', 'all')
+        
         batch, num_vertices, num_coors, device = *vertices.shape, vertices.device
         _, num_faces, _ = faces.shape
 
@@ -308,7 +389,20 @@ class MeshAutoencoder(Module):
             face_embed = face_embed.new_zeros(shape).masked_scatter(rearrange(face_mask, '... -> ... 1'), face_embed)  
         
         # encode face embeddings
-        face_embed = self.encoder(face_embed, mask=face_mask)
+        if self.pos_embed:
+            seq_len = face_embed.shape[1]  # Get sequence length from input
+            pos_emb = AbsolutePositionalEmbedding(
+                dim=face_embed.shape[-1],     # Feature dimension
+                max_seq_len=seq_len           # Must specify maximum sequence length
+            ).to(face_embed.device)
+
+            # Add positional embeddings to face_embed
+            face_embed = face_embed + pos_emb(face_embed)  # shape remains (batch_size, seq_len, dim)
+            face_embed = self.encoder(face_embed, mask=face_mask) * face_mask.unsqueeze(-1) 
+        else:
+            face_embed = self.encoder(face_embed, mask=face_mask)
+            # face_embed = face_embed * face_mask.unsqueeze(-1) 
+            
         
         if not return_face_coordinates:
             return face_embed
@@ -316,265 +410,14 @@ class MeshAutoencoder(Module):
         return face_embed, discrete_face_coords
 
     @beartype
-    def quantize_old(
-        self,
-        *,
-        faces: TensorType['b', 'nf', 3, int],
-        face_mask: TensorType['b', 'n', bool],
-        face_embed: TensorType['b', 'nf', 'd', float],
-        pivot_mask: Optional[TensorType['b', 'nv', bool]] = None,
-        pad_id = None,
-        rvq_sample_codebook_temp = 1.
-    ):
-        pad_id = default(pad_id, self.pad_id)
-        batch, num_faces, device = *faces.shape[:2], faces.device
-
-        max_vertex_index = faces.amax()
-        num_vertices = int(max_vertex_index.item() + 1)
-
-        face_embed = self.project_dim_codebook(face_embed)
-        face_embed = rearrange(face_embed, 'b nf (nv d) -> b nf nv d', nv = 3)
-
-        vertex_dim = face_embed.shape[-1]
-        vertices = torch.zeros((batch, num_vertices, vertex_dim), 
-                               device = device, dtype=face_embed.dtype)
-
-        # create pad vertex, due to variable lengthed faces
-
-        pad_vertex_id = num_vertices
-        vertices = pad_at_dim(vertices, (0, 1), dim = -2, value = 0.)
-
-        faces = faces.masked_fill(~rearrange(face_mask, 'b n -> b n 1'), pad_vertex_id)
-
-        # prepare for scatter mean
-
-        faces_with_dim = repeat(faces, 'b nf nv -> b (nf nv) d', d = vertex_dim)
-
-        face_embed = rearrange(face_embed, 'b ... d -> b (...) d')
-
-        # scatter mean
-
-        averaged_vertices = scatter_mean(vertices, faces_with_dim, face_embed, dim = -2)
-
-        # mask out null vertex token
-
-        mask = torch.ones((batch, num_vertices + 1), device = device, dtype = torch.bool)
-        mask[:, -1] = False
-
-        # rvq specific kwargs
-
-        quantize_kwargs = dict(mask = mask)
-
-        if isinstance(self.quantizer, ResidualVQ):
-            quantize_kwargs.update(sample_codebook_temp = rvq_sample_codebook_temp)
-
-        # a quantize function that makes it memory checkpointable
-
-        def quantize_wrapper_fn(inp):
-            unquantized, quantize_kwargs = inp
-            return self.quantizer(unquantized, **quantize_kwargs)
-
-        # maybe checkpoint the quantize fn
-
-        if self.checkpoint_quantizer:
-            quantize_wrapper_fn = partial(checkpoint, quantize_wrapper_fn, use_reentrant = False)
-
-        # residual VQ
-
-        quantized, codes, commit_loss = quantize_wrapper_fn((averaged_vertices, quantize_kwargs))
-
-        # gather quantized vertexes back to faces for decoding
-        # now the faces have quantized vertices
-
-        face_embed_output = quantized.gather(-2, faces_with_dim)
-        face_embed_output = rearrange(face_embed_output, 'b (nf nv) d -> b nf (nv d)', nv = 3)
-
-        # vertex codes also need to be gathered to be organized by face sequence
-        # for autoregressive learning
-
-        faces_with_quantized_dim = repeat(faces, 'b nf nv -> b (nf nv) q', q = self.num_quantizers)
-        codes_output = codes.gather(-2, faces_with_quantized_dim)
-
-        # make sure codes being outputted have this padding
-
-        face_mask = repeat(face_mask, 'b nf -> b (nf nv) 1', nv = 3)
-        codes_output = codes_output.masked_fill(~face_mask, self.pad_id)
-        
-        if pivot_mask is not None:
-            # collect vertex codes of pivot points
-            pivot_ind = pivot_mask
-            pivot_mask = pivot_ind != self.pad_id
-            pivot_ind[~pivot_mask] = 0
-
-            pivot_ind = repeat(pivot_ind, 'b nv -> b nv q', q = self.num_quantizers)
-            pivot_codes = codes.gather(-2, pivot_ind)
-            pivot_codes[~pivot_mask] = self.pad_token_id
-
-            # construct the final codes with pivot points
-            pivot_lens, face_lens = pivot_mask.sum(dim=1), face_mask.sum(dim=1)
-            max_len = (pivot_lens + face_lens).max() + 1
-            final_codes = torch.ones(codes_output.shape[0], max_len, 
-                                    codes_output.shape[2], dtype=torch.long).to(codes_output.device) * -1
-            for i in range(pivot_codes.shape[0]):
-                
-                final_codes[i, :pivot_lens[i]] = pivot_codes[i, :pivot_lens[i]]
-                final_codes[i, pivot_lens[i]] = self.pad_token_id
-                end = min(max_len - pivot_lens[i] - 1, codes_output.shape[1])
-                final_codes[i, pivot_lens[i] + 1: pivot_lens[i] + 1 + end] = codes_output[i, :end]
-                
-            codes_output = final_codes
-            
-        
-        # output quantized, codes, as well as commitment loss
-
-        return face_embed_output, codes_output, commit_loss
-
-    @beartype
-    def quantize_vert(
-        self,
-        *,
-        faces: TensorType['b', 'nf', 3, int],
-        face_mask: TensorType['b', 'n', bool],
-        face_embed: TensorType['b', 'nf', 'd', float],
-        pad_id = None,
-        rvq_sample_codebook_temp = 1.
-    ):
-        pad_id = default(pad_id, self.pad_id)
-        # batch, num_faces, device = *faces.shape[:2], faces.device
-
-        # max_vertex_index = faces.amax()
-        # num_vertices = int(max_vertex_index.item() + 1)
-
-        face_embed = self.project_dim_codebook(face_embed)
-        face_embed = rearrange(face_embed, 'b nf (nv d) -> b nf nv d', nv = 3)
-
-        # vertex_dim = face_embed.shape[-1]
-        # vertices = torch.zeros((batch, num_vertices, vertex_dim), device = device)
-
-        # # create pad vertex, due to variable lengthed faces
-
-        # pad_vertex_id = num_vertices
-        # vertices = pad_at_dim(vertices, (0, 1), dim = -2, value = 0.)
-
-        # faces = faces.masked_fill(~rearrange(face_mask, 'b n -> b n 1'), pad_vertex_id)
-
-        # # prepare for scatter mean
-
-        # faces_with_dim = repeat(faces, 'b nf nv -> b (nf nv) d', d = vertex_dim)
-
-        face_embed = rearrange(face_embed, 'b ... d -> b (...) d')
-
-        # # scatter mean
-
-        # averaged_vertices = scatter_mean(vertices, faces_with_dim, face_embed, dim = -2)
-
-        # mask out null vertex token
-
-        # mask = torch.ones((batch, num_vertices + 1), device = device, dtype = torch.bool)
-        # mask[:, -1] = False
-
-        # rvq specific kwargs
-
-        quantize_kwargs = dict()
-        # quantize_kwargs = dict(mask = mask)
-
-        if isinstance(self.quantizer, ResidualVQ):
-            quantize_kwargs.update(sample_codebook_temp = rvq_sample_codebook_temp)
-
-        # a quantize function that makes it memory checkpointable
-
-        def quantize_wrapper_fn(inp):
-            unquantized, quantize_kwargs = inp
-            return self.quantizer(unquantized, **quantize_kwargs)
-
-        # maybe checkpoint the quantize fn
-
-        if self.checkpoint_quantizer:
-            quantize_wrapper_fn = partial(checkpoint, quantize_wrapper_fn, use_reentrant = False)
-
-        # residual VQ
-
-        quantized, codes, commit_loss = quantize_wrapper_fn((face_embed, quantize_kwargs))
-        # quantized, codes, commit_loss = quantize_wrapper_fn((averaged_vertices, quantize_kwargs))
-
-        # gather quantized vertexes back to faces for decoding
-        # now the faces have quantized vertices
-
-        # face_embed_output = quantized.gather(-2, faces_with_dim)
-        # face_embed_output = rearrange(face_embed_output, 'b (nf nv) d -> b nf (nv d)', nv = 3)
-        face_embed_output = rearrange(quantized, 'b (nf nv) d -> b nf (nv d)', nv = 3)
-
-        # vertex codes also need to be gathered to be organized by face sequence
-        # for autoregressive learning
-
-        # faces_with_quantized_dim = repeat(faces, 'b nf nv -> b (nf nv) q', q = self.num_quantizers)
-        # codes_output = codes.gather(-2, faces_with_quantized_dim)
-        codes_output = codes
-
-        # make sure codes being outputted have this padding
-
-        face_mask = repeat(face_mask, 'b nf -> b (nf nv) 1', nv = 3)
-        codes_output = codes_output.masked_fill(~face_mask, self.pad_id)
-
-        # output quantized, codes, as well as commitment loss
-
-        return face_embed_output, codes_output, commit_loss
-
-
-    @beartype
-    def quantize_face(
-        self,
-        *,
-        faces: TensorType['b', 'nf', 3, int],
-        face_mask: TensorType['b', 'n', bool],
-        face_embed: TensorType['b', 'nf', 'd', float],
-        pad_id = None,
-        rvq_sample_codebook_temp = 1.
-    ):
-        # project face embeddings to codebook embeddings
-        
-        # maybe commented
-        face_embed = self.project_dim_codebook(face_embed)
-        face_embed = face_embed.masked_fill(~rearrange(face_mask, 'b nf -> b nf 1'), 0.)
-        
-        # rvq specific kwargs
-
-        quantize_kwargs = dict(mask = face_mask)
-        # quantize_kwargs = dict()
-
-        if isinstance(self.quantizer, ResidualVQ):
-            quantize_kwargs.update(sample_codebook_temp = rvq_sample_codebook_temp)
-
-        # a quantize function that makes it memory checkpointable
-
-        def quantize_wrapper_fn(inp):
-            unquantized, quantize_kwargs = inp
-            return self.quantizer(unquantized, **quantize_kwargs)
-
-        # maybe checkpoint the quantize fn
-
-        if self.checkpoint_quantizer:
-            quantize_wrapper_fn = partial(checkpoint, quantize_wrapper_fn, use_reentrant = False)
-
-        # residual VQ
-
-        quantized, codes, commit_loss = quantize_wrapper_fn((face_embed, quantize_kwargs))
-
-        # make sure codes being outputted have this padding
-
-        face_mask = rearrange(face_mask, 'b nf -> b nf 1')
-        codes_output = codes.masked_fill(~face_mask, self.pad_id)
-
-        # output quantized, codes, as well as commitment loss
-
-        return quantized, codes_output, commit_loss
-
-    @beartype
     def decode(
         self,
         quantized: TensorType['b', 'n', 'd', float],
         face_mask:  TensorType['b', 'n', bool]
     ):
+        # if self.kl_regularization:
+        quantized = self.latent_proj(quantized)
+
         conv_face_mask = rearrange(face_mask, 'b n -> b n 1')
         vertice_mask = repeat(face_mask, 'b nf -> b (nf nv)', nv = 3)
         x = quantized
@@ -585,102 +428,8 @@ class MeshAutoencoder(Module):
         x = self.decoder_coarse(x, mask = face_mask)
         x = self.coarse_to_fine(x)
         x = rearrange(x, 'b nf (nv d) -> b (nf nv) d', nv=3)
-        x = self.decoder_fine(x, mask = vertice_mask)
-        
+        x = self.decoder_fine(x, mask = vertice_mask) # * vertice_mask.unsqueeze(-1)
         return x
-
-    @beartype
-    @torch.no_grad()
-    def decode_from_codes_to_faces(
-        self,
-        codes: Tensor,
-        face_mask: Optional[TensorType['b', 'n', bool]] = None,
-        return_discrete_codes = False
-    ):
-        if self.sim_quant:
-            code_len = codes.shape[1] // self.num_quantizers * self.num_quantizers
-        else:
-            code_len = codes.shape[1] // 3 * 3
-            
-        codes = codes[:, :code_len]
-
-        codes = rearrange(codes, 'b ... -> b (...)')
-
-        if not exists(face_mask):
-            if self.sim_quant:
-                face_mask = reduce(codes != self.pad_id, 'b (nf q) -> b nf', 'all', q = self.num_quantizers)
-            else:
-                face_mask = reduce(codes != self.pad_id, 'b (nf nv q) -> b nf', 'all', nv = 3, q = self.num_quantizers)
-
-        # handle different code shapes
-
-        codes = rearrange(codes, 'b (n q) -> b n q', q = self.num_quantizers)
-
-        # decode
-
-        quantized = self.quantizer.get_output_from_indices(codes)
-        if not self.sim_quant:
-            quantized = rearrange(quantized, 'b (nf nv) d -> b nf (nv d)', nv = 3)
-
-        decoded = self.decode(
-            quantized,
-            face_mask = face_mask
-        )
-
-
-        # decoded = decoded.masked_fill(~face_mask[..., None], 0.)
-        pred_face_coords = self.to_coor_logits(decoded)
-
-        pred_face_coords = pred_face_coords.argmax(dim = -1)
-
-        pred_face_coords = rearrange(pred_face_coords, '... (v c) -> ... v c', v = 3)
-
-        # back to continuous space
-
-        continuous_coors = undiscretize(
-            pred_face_coords,
-            num_discrete = self.num_discrete_coors,
-            continuous_range = self.coor_continuous_range
-        )
-
-        # mask out with nan
-
-        continuous_coors = continuous_coors.masked_fill(~rearrange(face_mask, 'b nf -> b nf 1 1'), float('nan'))
-
-        if not return_discrete_codes:
-            return continuous_coors, face_mask
-
-        return continuous_coors, pred_face_coords, face_mask
-
-    @torch.no_grad()
-    def tokenize(self, vertices, faces, face_edges = None, pivot_mask = None, **kwargs):
-        assert 'return_codes' not in kwargs
-
-        inputs = [vertices, faces, face_edges]
-        inputs = [*filter(exists, inputs)]
-        ndims = {i.ndim for i in inputs}
-
-        assert len(ndims) == 1
-        batch_less = first(list(ndims)) == 2
-
-        if batch_less:
-            inputs = [rearrange(i, '... -> 1 ...') for i in inputs]
-
-        input_kwargs = dict(zip(['vertices', 'faces', 'face_edges'], inputs))
-
-        self.eval()
-
-        codes = self.forward(
-            **input_kwargs,
-            pivot_mask = pivot_mask,
-            return_codes = True,
-            **kwargs
-        )
-
-        if batch_less:
-            codes = rearrange(codes, '1 ... -> ...')
-
-        return codes
 
     @beartype
     def forward(
@@ -690,11 +439,9 @@ class MeshAutoencoder(Module):
         faces:          TensorType['b', 'nf', 3, int],
         face_edges:     Optional[TensorType['b', 'e', 2, int]] = None,
         pivot_mask:     Optional[TensorType['b', 'nv', bool]] = None,
-        return_codes = False,
         return_loss_breakdown = False,
         return_recon_faces = False,
         only_return_recon_faces = False,
-        rvq_sample_codebook_temp = 1.
     ):
         if not exists(face_edges):
             face_edges = derive_face_edges_from_faces(faces, pad_id = self.pad_id)
@@ -711,38 +458,28 @@ class MeshAutoencoder(Module):
             face_edges = face_edges,
             face_edges_mask = face_edges_mask,
             face_mask = face_mask,
-            return_face_coordinates = True
+            return_face_coordinates = True,
         )
-
-        if self.sim_quant:
-            quantized, codes, commit_loss = self.quantize_face(
-                face_embed = encoded,
-                faces = faces,
-                face_mask = face_mask_patch,
-                rvq_sample_codebook_temp = rvq_sample_codebook_temp
-            )
-        else:
-            quantized, codes, commit_loss = self.quantize_old(
-            # quantized, codes, commit_loss = self.quantize_vert(
-                face_embed = encoded,
-                faces = faces,
-                face_mask = face_mask,
-                pivot_mask = pivot_mask,
-                rvq_sample_codebook_temp = rvq_sample_codebook_temp
-            )
         
+        # quantized = encoded
+        # gaussian = DiagonalGaussianDistribution(quantized)
+        # kl_loss = gaussian.kl().mean()
+
+        # print('encoded', encoded.shape)
+
+        
+        latent, kl_loss = self.reparameterize(encoded, mask=None) 
+        
+        # latent = encoded
+
+        # print('latent', latent.shape)
         # make sure the right data type    
-        quantized = quantized.to(encoded.dtype)
-
-        if return_codes:
-            assert not return_recon_faces, 'cannot return reconstructed faces when just returning raw codes'
-            return codes
-
+        latent = latent.to(encoded.dtype)
+        
         decode = self.decode(
-            quantized,
+            latent,
             face_mask = face_mask_patch
         )
-
         pred_face_coords = self.to_coor_logits(decode)
 
         # compute reconstructed faces if needed
@@ -787,13 +524,11 @@ class MeshAutoencoder(Module):
             recon_loss = recon_losses[face_mask].mean()
 
         # calculate total loss
-
-        total_loss = recon_loss + \
-                     commit_loss.sum() * self.commit_loss_weight
-
+        total_loss = recon_loss + kl_loss.mean() * self.kl_loss_weight if self.kl_regularization else recon_loss
+        
         # calculate loss breakdown if needed
 
-        loss_breakdown = (recon_loss, commit_loss)
+        loss_breakdown = (recon_loss, kl_loss) if self.kl_regularization else (recon_loss, torch.tensor(0.0, device=recon_loss.device))
 
         # some return logic
 
