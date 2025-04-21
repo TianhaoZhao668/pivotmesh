@@ -171,6 +171,83 @@ class ShapeNetCore(torch.utils.data.Dataset):  # pragma: no cover
         
         return data
 
+class ShapeNetCore_obj(torch.utils.data.Dataset):  
+    def __init__(
+        self,
+        data_dir,
+        load_textures: bool = False,
+        texture_resolution: int = 4,
+        augment: bool = False,
+        augment_dict: dict = None,
+        return_model_path: bool = False,
+        return_pivot: bool = True,
+        pivot_rate: float = 0.1,
+        patch_size: int = 1,
+        quant_bit: int = 8,
+    ) -> None:
+        super().__init__()
+        self.model_paths = []
+        self.load_textures = load_textures
+        self.texture_resolution = texture_resolution
+        self.augment = augment
+        self.patch_size = patch_size
+        self.quant_bit = quant_bit
+        self.augment_dict = augment_dict
+        self.return_model_path = return_model_path
+        self.return_pivot = return_pivot
+        self.pivot_rate = pivot_rate
+
+        # 递归查找所有 .obj 文件
+        for root, _, files in os.walk(data_dir):
+            for file in files:
+                if file.endswith(".obj"):
+                    self.model_paths.append(path.join(root, file))
+
+        if not self.model_paths:
+            raise ValueError(f"No .obj files found in {data_dir}")
+
+    def __len__(self) -> int:
+        return len(self.model_paths)
+
+    def load_mesh(self, model_path):
+        # 加载并处理 mesh
+        mesh = load_process_mesh(model_path, quantization_bits=self.quant_bit, 
+                                 augment=self.augment, augment_dict=self.augment_dict)
+        verts, faces = mesh['vertices'], mesh['faces']
+        verts = torch.tensor(verts)
+        faces = torch.tensor(faces)
+        return verts, faces
+
+    def __getitem__(self, idx: int) -> Dict:
+        model_path = self.model_paths[idx]
+
+        try:
+            verts, faces = self.load_mesh(model_path)
+        except Exception as e:
+            print(f"Load mesh failed at: {model_path}, {e}")
+            random_idx = random.randint(0, len(self.model_paths) - 1)
+            model_path = self.model_paths[random_idx]
+            verts, faces = self.load_mesh(model_path)
+
+        data = {"vertices": verts, "faces": faces}
+
+        if self.return_pivot:
+            mesh = to_mesh(vertices=verts, faces=faces)
+            num_verts = len(verts)
+            degree = torch.tensor(mesh.vertex_degree)
+            assert num_verts == len(degree)
+
+            # 选择关键点
+            vals, indexes = torch.topk(degree, int(num_verts * self.pivot_rate) + 1, sorted=False)
+            pivot_len = 50 * int(10 * self.pivot_rate)
+            indexes = torch.nonzero(degree >= vals.min()).squeeze(dim=-1)[:pivot_len]
+
+            data["pivot_mask"] = indexes
+
+        if self.return_model_path:
+            data["model_path"] = model_path
+
+        return data
 
 class Objaverse(torch.utils.data.Dataset):  # pragma: no cover
     def __init__(
