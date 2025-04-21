@@ -158,7 +158,7 @@ def main(args):
     seq_len = torch.tensor(seq_len, dtype=torch.int).to(device=device)
 
     mask = torch.ones(bs, latent_size).to(device=device)
-    # mask = create_mask(bs, latent_size, seq_len)
+    mask = create_mask(bs, latent_size, seq_len)
     
     # short_ann_val = 'A table with legs.'
     model_kwargs = dict(mask=mask.long(), grid=grid.long(), seq_len=seq_len)
@@ -191,7 +191,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-MIN/3")
     parser.add_argument("--cfg-scale", type=float, default=1.0)
-    parser.add_argument("--num-sampling-steps", type=int, default=1000)
+    parser.add_argument("--num-sampling-steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default='C:/Users/Administrator/Desktop/abcde/results/013-DiT-MIN-2/checkpoints/0200000.pt',
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")

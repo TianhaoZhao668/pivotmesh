@@ -213,9 +213,8 @@ def main(args):
         decoder_dim = 384,
     ).to(device)
 
-    # first:
-    # checkpoint = torch.load('/root/github_code/pivotmesh/checkpoints/AE-shapenet_10000obj_under800_8channel_12en_768_18de_384_1e-4kl_1GCN_womask_ordered/mesh-autoencoder.ckpt.43.pt')
-    checkpoint = torch.load('/root/github_code/pivotmesh/checkpoints/AE-shapenet_10000obj_under800_8channel_12en_768_18de_384_1e-3kl_1GCN_mask_ordered/mesh-autoencoder.ckpt.31.pt')
+    
+    checkpoint = torch.load('/root/github_code/pivotmesh/checkpoints/AE-shapenet_10000obj_under800_8channel_12en_768_18de_384_1e-4kl_1GCN_womask_ordered/mesh-autoencoder.ckpt.43.pt')
     autoencoder.load_state_dict(checkpoint['model'])
     autoencoder.requires_grad = False
     autoencoder.eval()
@@ -280,7 +279,7 @@ def main(args):
 
     # Variables for monitoring/logging purposes:
     autoencoder.eval()
-    train_steps = 274000
+    train_steps = 650000
     log_steps = 0
     running_loss = 0
     start_time = time()
